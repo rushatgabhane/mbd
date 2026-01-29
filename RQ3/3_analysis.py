@@ -124,33 +124,46 @@ print(f"  50%+ avail: {avail_stats['above_50']:,} routes")
 print(f"  <10% avail: {avail_stats['below_10']:,} routes")
 
 print("\n--- Multi-hop reachability from major hubs ---")
-edges_local = routes.select("src", "dst").collect()
-graph = {}
-for row in edges_local:
-    graph.setdefault(row["src"], []).append(row["dst"])
 
-def bfs_reachability(graph, source, max_hops=4):
-    visited = {source}
-    frontier = {source}
-    reach_by_hop = {}
-    for hop in range(1, max_hops + 1):
-        next_frontier = set()
-        for node in frontier:
-            for nb in graph.get(node, []):
-                if nb not in visited:
-                    visited.add(nb)
-                    next_frontier.add(nb)
-        reach_by_hop[hop] = len(next_frontier)
-        frontier = next_frontier
-        if not frontier:
-            break
-    return reach_by_hop, len(visited) - 1
+hub_list = ["ATL", "ORD", "DFW", "DEN", "LAX"]
+hubs = spark.createDataFrame([(h,) for h in hub_list], ["hub"])
+edges = routes.select("src", "dst")
+
+reachability = hubs.select(
+    col("hub").alias("source"),
+    col("hub").alias("node"),
+    lit(0).alias("hops")
+)
+frontier = reachability.select("source", "node")
+
+for hop in range(1, 5):
+    new_nodes = frontier.alias("f").join(
+        edges.alias("e"), col("f.node") == col("e.src")
+    ).select(
+        col("f.source"), col("e.dst").alias("node")
+    ).distinct().alias("n").join(
+        reachability.alias("r"),
+        (col("n.source") == col("r.source")) & (col("n.node") == col("r.node")),
+        "left_anti"
+    ).withColumn("hops", lit(hop))
+
+    cnt = new_nodes.count()
+    if cnt == 0:
+        break
+    reachability = reachability.union(new_nodes)
+    frontier = new_nodes.select("source", "node")
+
+stats = reachability.filter(col("hops") > 0) \
+    .groupBy("source", "hops").count().collect()
+hub_data = {}
+for r in stats:
+    hub_data.setdefault(r["source"], {})[r["hops"]] = r["count"]
 
 print(f"  {'Hub':<6} {'1-hop':<8} {'2-hop':<8} {'3-hop':<8} {'Total':<8}")
-for hub in ["ATL", "ORD", "DFW", "DEN", "LAX"]:
-    if hub in graph:
-        reach, total = bfs_reachability(graph, hub)
-        print(f"  {hub:<6} {reach.get(1,0):<8} {reach.get(2,0):<8} {reach.get(3,0):<8} {total:<8}")
+for hub in hub_list:
+    h = hub_data.get(hub, {})
+    total = sum(h.values())
+    print(f"  {hub:<6} {h.get(1,0):<8} {h.get(2,0):<8} {h.get(3,0):<8} {total:<8}")
 
 total_flights = routes.agg(F.sum("flight_count")).first()[0]
 print(f"\nSummary: {num_airports} airports, {total_routes:,} routes, {total_flights:,} total flights")

@@ -1,8 +1,8 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col, lit, when
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-import heapq
+from pyspark.sql.functions import col, lit
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+from pyspark.sql.window import Window
 import sys
 
 spark = (SparkSession.builder
@@ -16,7 +16,7 @@ destination = sys.argv[2] if len(sys.argv) > 2 else "OTH"
 
 print(f"\nRouting {origin} -> {destination}")
 
-print("Loading routes from HDFS...")
+print("Loading routes...")
 edges_df = spark.read.parquet("/user/s3549976/direct_routes")
 edges_df = edges_df.filter(col("flight_count") >= 10)
 edges_df = edges_df.filter(~col("src").isin(["USA"]) & ~col("dst").isin(["USA"]))
@@ -26,19 +26,8 @@ edge_count = edges_df.count()
 airport_count = edges_df.select("src").union(edges_df.select(col("dst").alias("src"))).distinct().count()
 print(f"{airport_count} airports, {edge_count:,} routes")
 
-print("Building in-memory graph...")
-edges_local = edges_df.collect()
 
-graph = {}
-edge_data = {}
-
-for row in edges_local:
-    src, dst = row["src"], row["dst"]
-    graph.setdefault(src, []).append(dst)
-    edge_data[(src, dst)] = row.asDict()
-
-
-def bfs_spark(edges_df, source, target, max_hops=6):
+def bfs_spark(source, target, max_hops=6):
     schema = StructType([
         StructField("node", StringType(), False),
         StructField("dist", IntegerType(), False),
@@ -49,109 +38,119 @@ def bfs_spark(edges_df, source, target, max_hops=6):
 
     for hop in range(1, max_hops + 1):
         new_nodes = edges_df.alias("e").join(
-            frontier.alias("f"),
-            col("e.src") == col("f.node")
+            frontier.alias("f"), col("e.src") == col("f.node")
         ).join(
-            visited.alias("v"),
-            col("e.dst") == col("v.node"),
-            "left_anti"
+            visited.alias("v"), col("e.dst") == col("v.node"), "left_anti"
         ).select(
             col("e.dst").alias("node"),
             lit(hop).alias("dist"),
             col("e.src").alias("pred")
         ).dropDuplicates(["node"])
 
-        new_count = new_nodes.count()
-        if new_count == 0:
+        cnt = new_nodes.count()
+        if cnt == 0:
             break
 
         visited = visited.union(new_nodes)
 
-        target_row = new_nodes.filter(col("node") == target).first()
-        if target_row:
+        if new_nodes.filter(col("node") == target).count() > 0:
             print(f"  Found target at hop {hop}")
             break
 
         frontier = new_nodes.select("node")
-        print(f"  Hop {hop}: {new_count} new nodes")
+        print(f"  Hop {hop}: {cnt} new nodes")
 
     return visited
 
 
-def dijkstra(graph, edge_data, source, target, weight_key):
-    INF = float('inf')
-    dist = {source: 0}
-    pred = {source: None}
-    heap = [(0, source)]
-    visited = set()
+def shortest_path_spark(source, weight_col, max_iter=8):
+    schema = StructType([
+        StructField("node", StringType(), False),
+        StructField("dist", DoubleType(), False),
+        StructField("pred", StringType(), True)
+    ])
+    distances = spark.createDataFrame([(source, 0.0, None)], schema)
 
-    while heap:
-        d, u = heapq.heappop(heap)
-        if u in visited:
-            continue
-        visited.add(u)
-        if u == target:
-            break
-        if u not in graph:
-            continue
+    weight_edges = edges_df.select(
+        "src", "dst",
+        F.coalesce(col(weight_col), lit(999999.0)).alias("weight")
+    )
 
-        for v in graph[u]:
-            if v in visited:
-                continue
-            edge = edge_data.get((u, v), {})
-            w = edge.get(weight_key, INF)
-            if w is None:
-                w = INF
-            nd = d + w
-            if nd < dist.get(v, INF):
-                dist[v] = nd
-                pred[v] = u
-                heapq.heappush(heap, (nd, v))
+    for _ in range(max_iter):
+        relaxed = distances.alias("d").join(
+            weight_edges.alias("e"), col("d.node") == col("e.src")
+        ).select(
+            col("e.dst").alias("node"),
+            (col("d.dist") + col("e.weight")).alias("dist"),
+            col("e.src").alias("pred")
+        )
 
-    if target not in dist or dist[target] == INF:
+        combined = distances.union(relaxed)
+        w = Window.partitionBy("node").orderBy("dist")
+        new_distances = combined.withColumn("rn", F.row_number().over(w)) \
+                                .filter(col("rn") == 1).drop("rn")
+        new_distances.cache()
+        new_distances.count()
+        distances.unpersist()
+        distances = new_distances
+
+    return distances
+
+
+def reconstruct_path(dist_df, source, target):
+    pred_rows = dist_df.collect()
+    pred_map = {r["node"]: r["pred"] for r in pred_rows}
+
+    if target not in pred_map:
         return None, None
 
-    path = []
-    node = target
-    while node is not None:
-        path.append(node)
-        node = pred.get(node)
-    path.reverse()
-    return path, dist[target]
+    target_dist = None
+    for r in pred_rows:
+        if r["node"] == target:
+            target_dist = r["dist"]
+            break
 
-
-def reconstruct_bfs_path(visited_df, source, target):
-    dist_data = {row["node"]: (row["dist"], row["pred"]) for row in visited_df.collect()}
-    if target not in dist_data:
+    if target_dist is None:
         return None, None
 
     path = [target]
-    current = target
-    while current != source and dist_data[current][1]:
-        current = dist_data[current][1]
-        path.insert(0, current)
+    cur = target
+    while cur != source:
+        p = pred_map.get(cur)
+        if not p:
+            return None, None
+        path.append(p)
+        cur = p
+    path.reverse()
+    return path, target_dist
 
-    if path[0] != source:
-        return None, None
-    return path, dist_data[target][0]
 
-
-def print_path(path, edge_data, show_reliability=False):
+def print_path(path, show_reliability=False):
     if not path or len(path) < 2:
         return
 
+    leg_cond = None
+    for i in range(len(path) - 1):
+        c = (col("src") == path[i]) & (col("dst") == path[i+1])
+        leg_cond = c if leg_cond is None else (leg_cond | c)
+
+    legs = edges_df.filter(leg_cond).collect()
+    leg_map = {(r["src"], r["dst"]): r for r in legs}
+
     total_time = 0
     for i in range(len(path) - 1):
-        edge = edge_data.get((path[i], path[i+1]), {})
-        ft = edge.get("avg_flight_time") or 0
+        edge = leg_map.get((path[i], path[i+1]))
+        if not edge:
+            continue
+        ft = edge["avg_flight_time"] or 0
         total_time += ft
 
         print(f"  Leg {i+1}: {path[i]} -> {path[i+1]}")
-        print(f"    Carriers: {edge.get('carriers', 'N/A')}")
-        print(f"    Flights in history: {edge.get('flight_count', 0):,}")
-        print(f"    Days available: {edge.get('days_with_service', 0):,} ({edge.get('availability_pct', 0)}%)")
+        print(f"    Carriers: {edge['carriers'] or 'N/A'}")
+        print(f"    Flights in history: {edge['flight_count']:,}")
+        print(f"    Days available: {edge['days_with_service']:,} ({edge['availability_pct']}%)")
         if show_reliability:
-            print(f"    Avg flight time: {ft:.0f} min | p90 delay: {edge.get('p90_delay', 0):.0f} min | std: {edge.get('std_delay', 0):.1f}")
+            print(f"    Avg flight time: {ft:.0f} min | p90 delay: {edge['p90_delay']:.0f} min | std: {edge['std_delay']:.1f}")
         else:
             print(f"    Avg flight time: {ft:.0f} min")
 
@@ -159,35 +158,37 @@ def print_path(path, edge_data, show_reliability=False):
     print(f"  Total flight time: {total_time:.0f} min ({total_time/60:.1f} hrs)")
 
 
-print("\n--- Criterion 1: Fewest hops (BFS via Spark) ---")
-visited_hops = bfs_spark(edges_df, origin, destination, max_hops=6)
-path_hops, hops_result = reconstruct_bfs_path(visited_hops, origin, destination)
+print("\n--- Criterion 1: Fewest hops (BFS) ---")
+visited = bfs_spark(origin, destination)
+path_hops, hops_result = reconstruct_path(visited, origin, destination)
 
 if hops_result is not None:
     hops_result = int(hops_result)
     print(f"Result: {hops_result} hops")
-    print_path(path_hops, edge_data)
+    print_path(path_hops)
 else:
     print(f"No path found from {origin} to {destination}")
 
 
-print(f"\n--- Criterion 2: Fastest (Dijkstra, weight=avg_flight_time) ---")
-path_time, time_result = dijkstra(graph, edge_data, origin, destination, "avg_flight_time")
+print(f"\n--- Criterion 2: Fastest (weight=avg_flight_time) ---")
+dist_time = shortest_path_spark(origin, "avg_flight_time")
+path_time, time_result = reconstruct_path(dist_time, origin, destination)
 
 if time_result is not None:
     print(f"Result: {time_result:.0f} min ({time_result/60:.1f} hrs)")
-    print_path(path_time, edge_data)
+    print_path(path_time)
 else:
     time_result = None
     print("No path found")
 
 
-print(f"\n--- Criterion 3: Most reliable (Dijkstra, weight=reliability_score) ---")
-path_rel, rel_result = dijkstra(graph, edge_data, origin, destination, "reliability_score")
+print(f"\n--- Criterion 3: Most reliable (weight=reliability_score) ---")
+dist_rel = shortest_path_spark(origin, "reliability_score")
+path_rel, rel_result = reconstruct_path(dist_rel, origin, destination)
 
 if rel_result is not None:
     print(f"Result: reliability score = {rel_result:.0f}")
-    print_path(path_rel, edge_data, show_reliability=True)
+    print_path(path_rel, show_reliability=True)
 else:
     rel_result = None
     print("No path found")
