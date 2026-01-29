@@ -1,17 +1,3 @@
-"""
-Step 4: Compute All Valid Connections from Historical Data
-
-This script processes ALL flights to find every valid connection
-that actually occurred in history. A valid connection is when:
-- Flight 1 arrives at airport X
-- Flight 2 departs from airport X
-- Same day
-- Arrival + 45 min <= Departure (enough time to connect)
-- Layover <= 24 hours
-
-Output: Parquet files with proven connection statistics
-"""
-
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, lit, when, floor
@@ -23,21 +9,12 @@ spark = (SparkSession.builder
     .getOrCreate())
 spark.sparkContext.setLogLevel("ERROR")
 
-print(f"\n{'#'*70}")
-print(f" STEP 4: BUILD DIRECT ROUTE STATISTICS FROM HISTORICAL DATA")
-print(f"{'#'*70}")
-
-# =============================================================================
-# LOAD AND PREPARE FLIGHT DATA
-# =============================================================================
-print("\n[1] Loading all flight data...")
+print("Loading flight data...")
 df = spark.read.csv("/user/s3549976/flight_data/", header=True, inferSchema=True)
 
 total_raw = df.count()
-print(f"    Total raw flights: {total_raw:,}")
+print(f"Raw flights: {total_raw:,}")
 
-# Filter to completed flights
-print("\n[2] Filtering to completed flights...")
 flights = df.filter(
     (col("CANCELLED") == 0) &
     (col("DIVERTED") == 0) &
@@ -46,7 +23,6 @@ flights = df.filter(
     col("ARR_DELAY").isNotNull()
 )
 
-# Convert times to minutes since midnight
 flights = flights.withColumn(
     "dep_minutes",
     (floor(col("CRS_DEP_TIME") / 100) * 60 + col("CRS_DEP_TIME") % 100).cast("int")
@@ -55,14 +31,12 @@ flights = flights.withColumn(
     (floor(col("CRS_ARR_TIME") / 100) * 60 + col("CRS_ARR_TIME") % 100).cast("int")
 )
 
-# Handle overnight flights
 flights = flights.withColumn(
     "arr_minutes",
     when(col("arr_minutes") < col("dep_minutes"), col("arr_minutes") + 24 * 60)
     .otherwise(col("arr_minutes"))
 )
 
-# Select needed columns
 flights = flights.select(
     col("FL_DATE").alias("date"),
     col("ORIGIN").alias("src"),
@@ -78,21 +52,16 @@ flights = flights.select(
 
 flights.cache()
 total_flights = flights.count()
-print(f"    Completed flights: {total_flights:,}")
+print(f"Completed flights: {total_flights:,}")
 
-# Get date range
 date_stats = flights.agg(
     F.min("date").alias("min_date"),
     F.max("date").alias("max_date"),
     F.countDistinct("date").alias("total_days")
 ).first()
-print(f"    Date range: {date_stats['min_date']} to {date_stats['max_date']}")
-print(f"    Total days: {date_stats['total_days']}")
+print(f"Date range: {date_stats['min_date']} to {date_stats['max_date']} ({date_stats['total_days']} days)")
 
-# =============================================================================
-# COMPUTE DIRECT ROUTES (1-HOP)
-# =============================================================================
-print("\n[3] Computing direct route statistics...")
+print("Computing direct route statistics...")
 
 direct_routes = flights.groupBy("src", "dst").agg(
     F.count("*").alias("flight_count"),
@@ -114,26 +83,15 @@ direct_routes = flights.groupBy("src", "dst").agg(
 )
 
 direct_count = direct_routes.count()
-print(f"    Unique direct routes: {direct_count:,}")
+print(f"Unique direct routes: {direct_count:,}")
 
-print("    Saving direct routes...")
+print("Saving direct routes...")
 direct_routes.write.mode("overwrite").parquet("/user/s3549976/direct_routes")
 
+print(f"\nDone: {total_flights:,} flights, {date_stats['total_days']} days, {direct_count:,} routes")
+print("Saved to /user/s3549976/direct_routes")
 
-# =============================================================================
-# SUMMARY
-# =============================================================================
-print("\n" + "#"*70)
-print(" SUMMARY")
-print("#"*70)
-print(f"\n  Flights processed: {total_flights:,}")
-print(f"  Date range: {date_stats['total_days']} days")
-print(f"  Direct routes: {direct_count:,}")
-print("\n  Saved to: /user/s3549976/direct_routes")
-
-print("\n" + "="*70)
-print(" SAMPLE: TOP DIRECT ROUTES BY FREQUENCY")
-print("="*70)
+print("\n--- Top routes by frequency ---")
 direct_routes.orderBy(col("flight_count").desc()).select(
     "src", "dst", "flight_count", "days_with_service",
     "avg_flight_time", "reliability_score", "carriers"
